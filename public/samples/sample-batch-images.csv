@@ -1,0 +1,11 @@
+id,app_brand,app_class,app_abv,app_net,app_origin,image_file
+1,OLD TOM DISTILLERY,Kentucky Straight Bourbon Whiskey,45,750 mL,,label-01-pass.png
+2,Stone's Throw,Straight Rye Whiskey,50,750 mL,,label-02-case-difference.png
+3,Harbor Light Vodka,Vodka,40,1 L,,label-03-titlecase-warning.png
+4,Copper Ridge,Single Malt Whisky,43,700 mL,Scotland,label-04-wrong-abv.png
+5,Sunset Rum,Spiced Rum,35,750 mL,,label-05-altered-warning.png
+6,Pine Hollow,Blended Scotch Whisky,40,750 mL,Scotland,label-06-import-ok.png
+7,Redwood Tequila,Tequila Reposado,40,750 mL,Mexico,label-07-missing-warning.png
+8,Bluewater Gin,London Dry Gin,47,750 mL,England,label-08-glare-skew.jpg
+9,Silver Creek,Blended Canadian Whisky,40,750 mL,Canada,label-09-rotated-sideways.png
+10,Granite Peak,Bourbon Whiskey,47.5,750 mL,,label-10-header-not-bold.png
