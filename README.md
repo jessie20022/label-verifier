@@ -5,7 +5,7 @@ application submitted for it. An agent gives it the application details and a **
 label**; it reads the picture, compares every field, and reports what matches and what does not.
 A whole spreadsheet of applications and their pictures can be checked in one go.
 
-**Live app:** `https://<your-username>.github.io/label-verifier/`
+**Live app:** `https://jessie20022.github.io/label-verifier/`
 
 ## How it works
 
@@ -184,23 +184,3 @@ vite.config.ts  build settings, plus the small plugin that serves/bundles the OC
   true bold detection better. It would need network approval from IT and a security review, which is why
   it was left out of the prototype.
 - A real deployment would need the security, retention and PII review described by IT, and COLA integration.
-
-## Deploying to GitHub Pages (free)
-
-1. Create a **public** repo named `label-verifier`. If you use another name, change `base` in
-   `vite.config.ts` to `'/<your-repo-name>/'`.
-2. Push the code to `main`:
-   ```bash
-   git init
-   git add .
-   git commit -m "Label verifier with image reading"
-   git branch -M main
-   git remote add origin https://github.com/<your-username>/label-verifier.git
-   git push -u origin main
-   ```
-3. In the repo go to **Settings > Pages > Build and deployment > Source** and choose **GitHub Actions**.
-4. The workflow runs the tests, builds, and publishes. Watch it in the **Actions** tab. When it finishes the
-   site is live at `https://<your-username>.github.io/label-verifier/`.
-
-Commit `package-lock.json` (the workflow uses `npm ci`). The OCR engine files are taken from `node_modules`
-during the build, so nothing extra needs to be committed.
