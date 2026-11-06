@@ -74,7 +74,24 @@ export const checkBrand = (
   app: string,
   label: string,
   opts: CheckOptions = {}
-): CheckResult => checkText("Brand name", app, label, opts);
+): CheckResult => {
+  const result = checkText("Brand name", app, label, opts);
+
+  if (result.status === "pass" && compareText(app, label) === "loose") {
+    return {
+      ...result,
+      status: "review",
+      message:
+        `Brand names differ only in capitalization or punctuation: ` +
+        `label says "${collapse(label)}", application says "${collapse(
+          app
+        )}". ` +
+        "Please check that they refer to the same brand.",
+    };
+  }
+
+  return result;
+};
 
 export const checkClass = (
   app: string,

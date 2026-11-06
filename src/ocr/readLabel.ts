@@ -5,7 +5,6 @@ import { ensureEngine, recognize } from "./engine";
 import { estimateTilt, worthStraightening } from "./deskew";
 import { extractFields } from "./extractFields";
 import {
-  brandRegion,
   findLabelRegion,
   flankRegions,
   focusedRead,
@@ -13,33 +12,30 @@ import {
   type FocusVariant,
   type FocusGeometry,
 } from "./focus";
+
 import { renderForOcr, adaptiveThreshold, type Rotation } from "./preprocess";
 import type { Hints, LabelReading, OcrLine, OcrPage, Stage } from "./types";
 
-/** Set to true to print what the reader saw and decided. */
+/** Set to true to print what the reader saw and decided (useful when tuning). */
 const DEBUG = false;
 const debug = (...args: unknown[]) => {
   if (DEBUG) console.log(...args);
 };
 
-// PASTE THE TIMING HELPER HERE
-async function timed<T>(name: string, task: () => Promise<T>): Promise<T> {
-  const start = performance.now();
-
-  try {
-    return await task();
-  } finally {
-    console.log(
-      `[OCR TIME] ${name}: ${((performance.now() - start) / 1000).toFixed(2)}s`
-    );
-  }
-}
-
+/** A reading scoring at least this well is accepted without trying other orientations. */
 const GOOD_ENOUGH = 70;
+
 const ORIENTATIONS: Rotation[] = [0, 90, 270, 180];
+
+/** Trial tilts for photos too crooked for the engine to report usable baselines. */
 const TRIAL_TILTS = [10, -10, 15, -15];
+
 const SIDEWAYS_TILT = 45;
 
+/**
+ * Words that appear on alcohol labels. Finding several of them means the picture is the right
+ * way up: text turned on its side or upside down comes out as gibberish.
+ */
 const LABEL_WORD_RE =
   /\b(alc|alcohol|vol|volume|proof|whiske?y|whisky|bourbon|scotch|rye|vodka|gin|rum|tequila|brandy|liqueur|wine|beer|ale|lager|stout|cider|warning|government|surgeon|general|pregnan\w*|distill\w*|bottled|produced|imported|product|brewed|kentucky|straight|ml|oz|net|contents)\b|\d\s*%/gi;
 
@@ -51,6 +47,7 @@ function labelWordHits(page: OcrPage): number {
   return solid.match(LABEL_WORD_RE)?.length ?? 0;
 }
 
+/** Higher is better: average word confidence, discounted when very little text was found. */
 export function readingQuality(page: OcrPage): number {
   const words = page.lines
     .flatMap((line) => line.words)
@@ -66,6 +63,7 @@ export function readingQuality(page: OcrPage): number {
   return meanConfidence * (0.65 + 0.35 * coverage);
 }
 
+/** Ranking used to choose between readings: recognizable label words matter most. */
 function orientationScore(page: OcrPage): number {
   return labelWordHits(page) * 10 + readingQuality(page);
 }
@@ -79,6 +77,7 @@ interface Candidate {
   page: OcrPage;
   canvas: HTMLCanvasElement;
   rotation: Rotation;
+  /** The tilt handed to renderForOcr for this canvas (0 when none). */
   deskew: number;
   quality: number;
   hits: number;
@@ -103,9 +102,11 @@ function makeCandidate(
 const better = (a: Candidate, b: Candidate | null) =>
   !b || orientationScore(a.page) > orientationScore(b.page);
 
+/** Upright enough to stop looking at other orientations. */
 const isUpright = (c: Candidate) =>
   c.hits >= 3 || (c.hits >= 1 && c.quality >= GOOD_ENOUGH);
 
+/** Read the picture turned by `rotation`; a plain reading only, which is the fast path. */
 async function readPlain(
   bitmap: ImageBitmap,
   rotation: Rotation
@@ -114,6 +115,7 @@ async function readPlain(
   return makeCandidate(await recognize(canvas), canvas, rotation, 0);
 }
 
+/** Straighten a slightly crooked picture and keep the result if it reads better. */
 async function straighten(
   bitmap: ImageBitmap,
   current: Candidate
@@ -132,6 +134,7 @@ async function straighten(
   return better(candidate, current) ? candidate : current;
 }
 
+/** Row-wise duplicate removal so the same text read twice does not count twice. */
 function addLines(target: OcrLine[], more: OcrLine[]): void {
   for (const line of more) {
     const key = line.text.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -146,24 +149,24 @@ function addLines(target: OcrLine[], more: OcrLine[]): void {
         Math.abs(existing.bbox.x0 - line.bbox.x0) < h * 3
       );
     });
-
     if (!twin) target.push(line);
   }
 }
 
-/** General focused reading for the rest of the label. */
-const FOCUS_VARIANTS = [{ channel: "lum", psm: 11 }] as const;
+/** Both the colour variants that usually reveal small print on coloured labels. */
+const FOCUS_VARIANTS: FocusVariant[] = [
+  { channel: "red", psm: 11 },
+  { channel: "lum", psm: 11 },
+];
 
-/** Small print beside the brand name. */
+/** For the narrow strips beside the brand name: one block of a few short lines. */
 const FLANK_VARIANTS: FocusVariant[] = [
   { channel: "red", psm: 6, enlarge: 1.35 },
   { channel: "red", psm: 6, enlarge: 1.8 },
   { channel: "lum", psm: 6, enlarge: 1.35 },
 ];
 
-/** Two targeted attempts for the brand crop. */
-const BRAND_VARIANTS = [{ channel: "lum", psm: 11 }] as const;
-
+/** Does this reading hold everything the comparison needs (except the optional warning)? */
 function isComplete(fields: {
   brand: string;
   classType: string;
@@ -178,6 +181,9 @@ function isComplete(fields: {
   );
 }
 
+/**
+ * Read an image, extract label fields, and estimate warning boldness.
+ */
 export async function readLabelImage(
   file: Blob,
   options: ReadOptions = {}
@@ -201,16 +207,17 @@ export async function readLabelImage(
   }
 
   try {
-    // 1. First reading, upright.
+    // 1. First reading, upright. Most labels need nothing more than this to find their orientation.
     stage("read");
     let best: Candidate | null = await readPlain(bitmap, 0);
 
-    // 2. Try other orientations only when the first reading is poor.
+    // 2. Only if the words do not look like label words, turn the picture and look again.
     if (!isUpright(best)) {
       for (const rotation of ORIENTATIONS.slice(1)) {
         stage("rotate");
         const candidate = await readPlain(bitmap, rotation);
 
+        // Text turned on its side is reported with a steep slope: not a usable reading.
         if (Math.abs(estimateTilt(candidate.page.lines)) > SIDEWAYS_TILT)
           continue;
 
@@ -219,11 +226,18 @@ export async function readLabelImage(
       }
     }
 
+    if (
+      Math.abs(estimateTilt(best.page.lines)) > SIDEWAYS_TILT &&
+      best.rotation === 0
+    ) {
+      // Nothing better was found; keep the upright reading.
+    }
+
     // 3. Straighten a crooked photo.
     stage("straighten");
     best = await straighten(bitmap, best);
 
-    // 4. Try fixed tilts and thresholding only when the reading is still poor.
+    // 4. Still little to go on: try fixed tilts, then a high-contrast version.
     if (best.hits < 2 && best.quality < GOOD_ENOUGH) {
       for (const tilt of TRIAL_TILTS) {
         const canvas = renderForOcr(bitmap, best.rotation, tilt);
@@ -233,7 +247,6 @@ export async function readLabelImage(
           best.rotation,
           tilt
         );
-
         if (better(candidate, best)) best = candidate;
         if (isUpright(best)) break;
       }
@@ -245,26 +258,24 @@ export async function readLabelImage(
         best.rotation,
         best.deskew
       );
-
-      if (better(candidate, best)) {
-        best = { ...candidate, canvas: best.canvas };
-      }
+      if (better(candidate, best)) best = { ...candidate, canvas: best.canvas };
     }
 
     stage("extract");
-
     debug(
       "FIRST PASS:",
       best.page.lines.map((line, index) => `${index}: ${line.text}`).join("\n")
     );
 
-    // 5. Extract fields from the first pass.
+    // 5. First extraction from the first pass alone.
     const firstPass = extractFields(best.page.lines, options.hints);
     let fields = firstPass.fields;
     let warningWords = firstPass.warningWords;
     let lines = best.page.lines;
 
-    // 6. Re-read the label when fields are missing or hints are not covered.
+    // 6. Small print and decorative lettering: read the label area again from the original photo,
+    // at full size. Skipped when the first pass already found everything.
+
     if (
       !isComplete(fields) ||
       !coversHint(fields.brand, options.hints?.brand) ||
@@ -287,45 +298,8 @@ export async function readLabelImage(
           canvasHeight: best.canvas.height,
         };
 
+        // Start with the original OCR lines.
         const merged: OcrLine[] = [...best.page.lines];
-
-        // Targeted brand OCR: exactly two attempts.
-        const brandCrop = options.hints?.brand
-          ? brandRegion(
-              best.page.lines,
-              region,
-              best.canvas.width,
-              best.canvas.height
-            )
-          : null;
-
-        if (brandCrop) {
-          const brandReadings = await focusedRead(
-            geometry,
-            brandCrop,
-            BRAND_VARIANTS
-          );
-
-          debug(
-            "BRAND CROP OCR:",
-            JSON.stringify(
-              brandReadings.map((reading, index) => ({
-                variant: index,
-                lines: reading.map((line) => ({
-                  text: line.text,
-                  confidence: Math.round(line.confidence),
-                  bbox: line.bbox,
-                })),
-              })),
-              null,
-              2
-            )
-          );
-
-          for (const reading of brandReadings) {
-            addLines(merged, reading);
-          }
-        }
 
         // General focused reading for the rest of the label.
         const readings = await focusedRead(geometry, region, FOCUS_VARIANTS);
@@ -348,10 +322,8 @@ export async function readLabelImage(
         debug(
           "FLANK LINES:",
           JSON.stringify(
-            flankReadings.map((reading) =>
-              reading.map(
-                (line) => `${Math.round(line.confidence)} ${line.text}`
-              )
+            flankReadings.map((r) =>
+              r.map((l) => `${Math.round(l.confidence)} ${l.text}`)
             ),
             null,
             1
@@ -360,6 +332,31 @@ export async function readLabelImage(
 
         for (const reading of flankReadings) {
           addLines(merged, reading);
+        }
+
+        // Very large brand lettering is read better at a smaller size than the passes above use.
+        // If the brand still does not match the application, read the label area once more at about
+        // the first-pass size (red channel, sparse text). Only runs when the brand is missing.
+        if (
+          options.hints?.brand &&
+          !coversHint(
+            extractFields(merged, options.hints).fields.brand,
+            options.hints.brand
+          )
+        ) {
+          const brandReadings = await focusedRead(geometry, region, [
+            { channel: "red", psm: 11, scale: 1.25 },
+            { channel: "max", psm: 11, scale: 1 },
+          ]);
+          debug(
+            "BRAND FALLBACK LINES:",
+            JSON.stringify(
+              brandReadings.map((r) =>
+                r.map((l) => `${Math.round(l.confidence)} ${l.text}`)
+              )
+            )
+          );
+          for (const reading of brandReadings) addLines(merged, reading);
         }
 
         merged.sort((a, b) =>
@@ -375,32 +372,11 @@ export async function readLabelImage(
           best.canvas.height
         );
 
-        debug("BRAND CROP:", JSON.stringify(brandCrop));
-
-        debug(
-          "BRAND READINGS:",
-          JSON.stringify(
-            brandCrop
-              ? merged
-                  .filter(
-                    (line) =>
-                      line.bbox.x0 >= brandCrop.x &&
-                      line.bbox.x1 <= brandCrop.x + brandCrop.width &&
-                      line.bbox.y0 >= brandCrop.y &&
-                      line.bbox.y1 <= brandCrop.y + brandCrop.height
-                  )
-                  .map((line) => `${Math.round(line.confidence)} ${line.text}`)
-              : []
-          )
-        );
-
         debug(
           "FOCUSED LINES:",
           JSON.stringify(
-            readings.map((reading) =>
-              reading.map(
-                (line) => `${Math.round(line.confidence)} ${line.text}`
-              )
+            readings.map((r) =>
+              r.map((l) => `${Math.round(l.confidence)} ${l.text}`)
             ),
             null,
             1
@@ -425,7 +401,8 @@ export async function readLabelImage(
       }
     }
 
-    // 7. Re-read the government warning block when one was detected.
+    // 7. The warning is long and set in small type, so a single slip anywhere in it matters.
+    // Read the block again on its own and keep whichever reading is closest to the required text.
     if (fields.warning) {
       try {
         const better = await rereadWarning(
@@ -435,7 +412,6 @@ export async function readLabelImage(
           fields.warning,
           options.hints
         );
-
         if (better) {
           fields = { ...fields, warning: better.warning };
         }
@@ -446,7 +422,7 @@ export async function readLabelImage(
 
     debug("EXTRACTED FIELDS:", fields);
 
-    // 8. Estimate government-warning boldness.
+    // 7. Estimate government-warning boldness.
     const bold = fields.warning
       ? estimateBold(best.canvas, warningWords.header, warningWords.body)
       : { verdict: "unknown" as const, ratio: null };
@@ -473,31 +449,28 @@ export async function readLabelImage(
   }
 }
 
-/** Every meaningful word of the application's value shows up approximately in the OCR text. */
+/** Every meaningful word of the application's value shows up (roughly) in what was read. */
 function coversHint(read: string, hint?: string): boolean {
   if (!hint) return true;
-
-  const words = (text: string) =>
-    text
+  const words = (t: string) =>
+    t
       .toLowerCase()
       .split(/[^a-z0-9']+/)
-      .filter((word) => word.length >= 3);
-
+      .filter((w) => w.length >= 3);
   const have = words(read);
-
-  return words(hint).every((word) =>
-    have.some((candidate) => similarity(candidate, word) >= 0.8)
-  );
+  return words(hint).every((w) => have.some((h) => similarity(h, w) >= 0.8));
 }
 
 const WARNING_START_RE = /g[o0]vernment\s+warn/i;
 
+/** Edits needed to turn a reading into the required warning (lower is closer). */
 const warningDistance = (text: string) =>
   levenshtein(
     text.replace(/\s+/g, " ").trim().toLowerCase(),
     WARNING.toLowerCase()
   );
 
+/** Read just the warning block, larger and as one block of text, and keep it if it is closer. */
 async function rereadWarning(
   bitmap: ImageBitmap,
   best: Candidate,
@@ -513,19 +486,16 @@ async function rereadWarning(
 
   const h = Math.max(header.bbox.y1 - header.bbox.y0, 12);
   const label = findLabelRegion(lines, best.canvas.width, best.canvas.height);
-
   const x = Math.max(0, Math.min(label.x, header.bbox.x0 - h));
   const right = Math.min(
     best.canvas.width,
     Math.max(label.x + label.width, header.bbox.x1 + h)
   );
-
   const y = Math.max(0, header.bbox.y0 - h * 0.6);
   const bottom = Math.min(
     best.canvas.height,
     Math.max(header.bbox.y1 + h * 9, label.y + label.height)
   );
-
   const region = { x, y, width: right - x, height: bottom - y };
 
   const readings = await focusedRead(
@@ -537,6 +507,7 @@ async function rereadWarning(
       canvasHeight: best.canvas.height,
     },
     region,
+    // Enlarge so the letters come out about 36 pixels tall, the size the reader handles best.
     [
       { channel: "lum", psm: 6, scale: Math.min(3.5, Math.max(1, 36 / h)) },
       { channel: "lum", psm: 6, scale: Math.min(3.5, Math.max(1.4, 52 / h)) },
@@ -551,9 +522,7 @@ async function rereadWarning(
   for (const reading of readings) {
     const result = extractFields(reading, hints);
     if (!result.fields.warning) continue;
-
     const distance = warningDistance(result.fields.warning);
-
     if (distance < bestDistance) {
       bestDistance = distance;
       bestText = result.fields.warning;

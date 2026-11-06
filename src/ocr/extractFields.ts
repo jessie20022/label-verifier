@@ -3,7 +3,7 @@ import type { LabelFields } from "../rules/types";
 import type { Hints, OcrLine, OcrWord } from "./types";
 
 /** Set to true to print what the extractor saw and decided (useful when tuning). */
-const DEBUG = true;
+const DEBUG = false;
 const debug = (...args: unknown[]) => {
   if (DEBUG) console.log(...args);
 };
@@ -224,6 +224,23 @@ function buildRows(lines: OcrLine[], indexes: number[]): Row[] {
   });
 }
 
+/** Mostly real-looking words, not a scatter of stray characters ("AL pn 9 oro EEO"). */
+function looksLikeWords(text: string): boolean {
+  const words = text.split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+  const good = words.filter((w) => {
+    const l = w.replace(/[^A-Za-z]/g, "");
+    if (l.length < 3 || l.length < w.replace(/['".,&-]/g, "").length * 0.8)
+      return false;
+    const title = l === l[0].toUpperCase() + l.slice(1).toLowerCase();
+    return (
+      (l === l.toUpperCase() || l === l.toLowerCase() || title) &&
+      /[aeiouyAEIOUY]/.test(l)
+    );
+  });
+  return good.length >= Math.ceil(words.length * 0.6);
+}
+
 /** Tidy text that is about to be shown as "what the label says". */
 function cleanText(text: string): string {
   return text
@@ -386,11 +403,25 @@ function locateByWords(
   const hits: WordHit[] = [];
   for (const piece of [...pieces, ...joined]) {
     wanted.forEach((token, ti) => {
-      const score = similarity(piece.text, token);
+      let text = piece.text;
+      let score = similarity(text, token);
+      // Two words run together ("BULLEITBOURBON"): look for the word inside the piece.
+      if (piece.text.length >= token.length + 3 && token.length >= 5) {
+        for (let len = token.length - 1; len <= token.length + 1; len++) {
+          for (let at = 0; at + len <= piece.text.length; at++) {
+            const window = piece.text.slice(at, at + len);
+            const s2 = similarity(window, token);
+            if (s2 > score && s2 >= 0.85) {
+              score = s2;
+              text = window;
+            }
+          }
+        }
+      }
       const need = token.length <= 4 ? 0.99 : 0.8;
       if (score >= need) {
         hits.push({
-          text: piece.text,
+          text,
           token: ti,
           score,
           line: piece.line,
@@ -446,17 +477,16 @@ function locateByWords(
   const need = wanted.length === 1 ? 1 : Math.ceil(wanted.length * 0.6);
   if (best.picked.length < need) return null;
 
-  // Reading order: group into rows by height, then left to right within a row.
-  const byY = [...best.picked].sort((a, b) => a.yc - b.yc);
-  const rows: WordHit[][] = [];
-  for (const hit of byY) {
-    const row = rows[rows.length - 1];
-    const rowY = row ? mean(row.map((r) => r.yc)) : 0;
-    const rowMin = row ? Math.min(...row.map((r) => r.h), hit.h) : 0;
-    if (row && Math.abs(hit.yc - rowY) <= rowMin * 0.75) row.push(hit);
-    else rows.push([hit]);
-  }
-  const ordered = rows.flatMap((row) => row.sort((a, b) => a.x - b.x));
+  // Reading order. Positions from several readings of a tilted label are not reliable enough to
+  // order words across rows, so the application's own word order is used, except when every word
+  // sits on one row, where left-to-right position is trustworthy.
+  const smallest = Math.min(...best.picked.map((h) => h.h));
+  const ys = best.picked.map((h) => h.yc);
+  const oneLine = new Set(best.picked.map((h) => h.line)).size === 1;
+  const oneRow = oneLine && Math.max(...ys) - Math.min(...ys) <= smallest * 0.6;
+  const ordered = oneRow
+    ? [...best.picked].sort((a, b) => a.x - b.x)
+    : [...best.picked].sort((a, b) => a.token - b.token);
 
   return {
     text: cleanText(ordered.map((h) => h.text).join(" ")),
@@ -479,6 +509,22 @@ function classLikeShare(text: string): number {
 
 /** A line that is only a class description ("Kentucky Straight Bourbon Whiskey"). */
 const isClassLikeLine = (text: string) => classLikeShare(text) >= 0.7;
+
+/** A piece of a class word that lost letters in reading ("iskey" from "whiskey"). */
+function isClassFragment(text: string): boolean {
+  const words = normalizeClassText(text).split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+  return words.every(
+    (w) =>
+      CLASS_WORDS.includes(w) ||
+      CLASS_MODIFIERS.has(w) ||
+      (w.length >= 3 &&
+        (CLASS_WORDS.some((c) => c.length > w.length && c.includes(w)) ||
+          [...CLASS_MODIFIERS].some(
+            (c) => c.length > w.length && c.includes(w)
+          )))
+  );
+}
 
 function findClassWord(word: string): string | null {
   if (CLASS_WORDS.includes(word)) return word;
@@ -671,7 +717,9 @@ export function pickAbv(ev: Evidence): { text: string; conf: number } {
   let bestScore = -1;
   for (const p of pcts) {
     const agrees = proofs.some((q) => Math.abs(q.value - 2 * p.value) < 0.01);
-    const score = p.score + (agrees ? 150 : 0);
+    // "45% ALC. BY VOL." is far more trustworthy than a bare "4%" fragment.
+    const labelled = /alc|vol/i.test(p.best.text) ? 100 : 0;
+    const score = p.score + (agrees ? 150 : 0) + labelled;
     if (score > bestScore) {
       bestScore = score;
       bestPct = p;
@@ -933,7 +981,6 @@ export function extractFields(
       (index) =>
         lines[index].confidence >= 40 &&
         letters(lines[index].text) >= 3 &&
-        !classLineIndexes.has(index) &&
         !isClassLikeLine(lines[index].text) &&
         !ABV_RE.test(lines[index].text) &&
         !PROOF_RE.test(lines[index].text) &&
@@ -943,7 +990,7 @@ export function extractFields(
   const candidates = eligibleBrandLines();
 
   if (hints.brand?.trim()) {
-    // A supplied brand is the target. Only accept OCR text that matches it.
+    // Prefer OCR text matching the supplied brand hint.
     const hintHit =
       locateByWords(lines, new Set(candidates), hints.brand, true) ??
       locate(lines, new Set(candidates), hints.brand);
@@ -957,20 +1004,25 @@ export function extractFields(
     if (hintHit) {
       fields.brand = hintHit.text;
       confidence.brand = hintHit.conf;
-
       hintHit.lines.forEach((index) => brandLines.add(index));
-    } else {
-      // Do not substitute unrelated OCR text for the supplied brand.
-      fields.brand = "";
-      delete confidence.brand;
-
-      debug("BRAND REJECTED: no OCR candidate matched the supplied hint.");
     }
-  } else if (candidates.length) {
+  }
+  // No hint, or the application's brand is nowhere on the label: report what the label shows, so a
+  // real mismatch is reported as a mismatch. With a hint, only clean, confidently read text is
+  // used; stray characters are never offered as the brand.
+  const fallbackPool = hints.brand?.trim()
+    ? candidates.filter(
+        (index) =>
+          lines[index].confidence >= 60 &&
+          looksLikeWords(lines[index].text) &&
+          !isClassFragment(lines[index].text)
+      )
+    : candidates.filter((index) => !isClassFragment(lines[index].text));
+  if (!fields.brand && fallbackPool.length) {
     // No hint supplied: use the existing visual-size fallback.
-    let best = candidates[0];
+    let best = fallbackPool[0];
 
-    for (const index of candidates) {
+    for (const index of fallbackPool) {
       const current = lines[index];
       const selected = lines[best];
 
@@ -990,7 +1042,7 @@ export function extractFields(
 
     while (
       lo > 0 &&
-      candidates.includes(lo - 1) &&
+      fallbackPool.includes(lo - 1) &&
       canMergeBrandLines(lines[lo - 1], lines[lo], referenceHeight)
     ) {
       lo--;
@@ -998,7 +1050,7 @@ export function extractFields(
 
     while (
       hi < lines.length - 1 &&
-      candidates.includes(hi + 1) &&
+      fallbackPool.includes(hi + 1) &&
       canMergeBrandLines(lines[hi], lines[hi + 1], referenceHeight)
     ) {
       hi++;
@@ -1016,7 +1068,7 @@ export function extractFields(
     );
 
     for (let index = lo; index <= hi; index++) {
-      if (candidates.includes(index)) {
+      if (fallbackPool.includes(index)) {
         brandLines.add(index);
       }
     }
